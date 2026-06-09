@@ -148,9 +148,7 @@ class ButtonFinder:
             # Either backfill timesteps that come before the first searched timestep or
             # re-use the button locations of the timestep just before this one since it's either
             # a searched timestep or a timestep we just copied locations into.
-            copy_t = self.search_timesteps[0] = (
-                self.search_timesteps[0] if t < self.search_timesteps[0] else t - 1
-            )
+            copy_t = self.search_timesteps[0] if t < self.search_timesteps[0] else t - 1
 
             # Preload all images for this timestep so we only read from disk once and
             # convert all relevant data to numpy arrays since iterating through xarrays is slow.
@@ -550,7 +548,14 @@ class BeadFinder:
                 ("mark", "time"),
                 np.repeat(beads[:, np.newaxis, 0], assay.sizes["time"], axis=1),
             ),
+            valid=(
+                ("mark", "time"),
+                np.ones((num_beads, assay.sizes["time"]), dtype=bool),
+            ),
         )
+
+        if num_beads == 0:
+            return assay
 
         # Create a label array that contains the areas owned by each bead.
         labels = utils.circle_labels(beads.astype(int), assay.sizes["im_y"], assay.sizes["im_x"])
@@ -597,13 +602,6 @@ class BeadFinder:
             assay.roi[:, i] = roi
 
         assay.mg.cache(["roi", "fg", "bg"])
-        assay = assay.assign_coords(
-            valid=(
-                ("mark", "time"),
-                np.ones((assay.sizes["mark"], assay.sizes["time"]), dtype=bool),
-            ),
-        )
-
         return assay
 
     @registry.components.register("find_beads")
