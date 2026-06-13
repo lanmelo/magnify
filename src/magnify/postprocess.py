@@ -37,11 +37,12 @@ def restore_format(xp: xr.Dataset | xr.DataArray) -> xr.Dataset | xr.DataArray:
         # If there are no original dimensions in this variable then don't do anything.
         if len(original_dims) > 0:
             var_dims = list(var.dims)
-            # We guarantee that original dimensions are contiguous so find their start and end.
+            # Find the indices of original dimensions in the current variable dimensions.
             idxs = [i for i, x in enumerate(var_dims) if x in original_dims]
-            start, end = (idxs[0], idxs[-1] + 1)
-            # Keep all non-original dimensions in the same order while permuting the originals.
-            dim_order = var_dims[:start] + original_dims + var_dims[end:]
+            # Permute the original dimensions to match their order in __original_tile_dims__.
+            dim_order = list(var_dims)
+            for idx, dim in zip(idxs, original_dims, strict=True):
+                dim_order[idx] = dim
             xp[name] = var.transpose(*dim_order)
 
     del xp.attrs["__original_tile_dims__"]
