@@ -1,5 +1,6 @@
 import xarray as xr
 
+from magnify import caching
 from magnify.registry import components
 
 
@@ -38,11 +39,17 @@ class Stitcher:
         # Move the time and channel axes back to the front.
         images = images.transpose("channel", "time", "im_y", "im_x")
 
-        # Rechunk the array so each chunk is a single tile and cache the intermediate results.
+        # Rechunk the array so each chunk is a single (clipped) tile and cache the intermediate
+        # results. Each tile loses `overlap` pixels per axis during clipping above.
         assay["image"] = images.chunk(
-            {"channel": 1, "time": 1, "im_y": assay.sizes["tile_y"], "im_x": assay.sizes["tile_x"]}
+            {
+                "channel": 1,
+                "time": 1,
+                "im_y": assay.sizes["tile_y"] - self.overlap,
+                "im_x": assay.sizes["tile_x"] - self.overlap,
+            }
         )
-        assay.mg.cache("image")
+        assay["image"].data = caching.cache(assay["image"].data)
         return assay
 
     @components.register("stitch")
