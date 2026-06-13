@@ -47,9 +47,11 @@ def annulus(
     inner_radius: int,
     value: Any = 1.0,
 ) -> np.ndarray:
-    outer_circle = circle(image_shape, center, outer_radius, value)
-    inner_circle = circle(image_shape, center, inner_radius, value)
-    return outer_circle & ~inner_circle
+    # Build the mask with integer circles so the bitwise ops are valid, then apply value.
+    outer_circle = circle(image_shape, center, outer_radius, value=1)
+    inner_circle = circle(image_shape, center, inner_radius, value=1)
+    mask = outer_circle & ~inner_circle
+    return mask.astype(type(value)) * value
 
 
 @numba.jit(nopython=True)
@@ -69,6 +71,10 @@ def bounding_box(
     if bottom > image_height:
         top -= bottom - image_height
         bottom = image_height
+    # Clamp in case the box is larger than the image, so we never return a negative
+    # index that would wrap around when used to slice.
+    if top < 0:
+        top = 0
     left = x - box_length // 2
     right = x + ceildiv(box_length, 2)
     if left < 0:
@@ -77,6 +83,8 @@ def bounding_box(
     if right > image_width:
         left -= right - image_width
         right = image_width
+    if left < 0:
+        left = 0
     return top, bottom, left, right
 
 
@@ -264,7 +272,13 @@ def filter_neighbors(circles, min_dist):
 
     exclusion_disk = circle_points(min_dist, four_connected=True)
 
+    # Circle centers can be off-image (negative). Grow the pad by the most off-chip center so its
+    # index stays non-negative; otherwise it would silently wrap to the opposite border. (The high
+    # side already auto-scales because the array is sized from the actual max coordinate.)
     pad = 2 * min_dist + 1
+    coord_min = min(circles[:, 0].min(), circles[:, 1].min())
+    if coord_min < 0:
+        pad -= coord_min
     claimed = -np.ones(
         (circles[:, 0].max() + 2 * pad, circles[:, 1].max() + 2 * pad), dtype=np.int32
     )
@@ -397,6 +411,9 @@ def circle_labels(circles, num_rows, num_cols):
 
 @numba.njit
 def filled_circle_points(r):
+    if r == 0:
+        # A zero-radius circle is just its center point.
+        return np.zeros((1, 2), dtype=np.int32)
     size = 2 * r + 1
     arr = np.zeros((size, size), dtype=np.uint8)
     pts = np.zeros((size**2, 2), dtype=np.int32)
@@ -434,6 +451,9 @@ def filled_circle_points(r):
 def circle_points(r, four_connected=False):
     # Draw a circle using the Breseham circle algorithm
     # see: https://funloop.org/post/2021-03-15-bresenham-circle-drawing-algorithm.html
+    if r == 0:
+        # A zero-radius circle is just its center point.
+        return np.zeros((1, 2), dtype=np.int32)
     points = np.zeros((20 * r, 2), dtype=np.int32)
     x = 0
     y = -r

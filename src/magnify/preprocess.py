@@ -2,10 +2,11 @@ import os
 import pathlib
 
 import dask.array as da
+import dask_image.ndinterp
 import tifffile
 import xarray as xr
 
-from magnify import registry, utils
+from magnify import caching, registry, utils
 
 
 @registry.component("standardize_format")
@@ -53,9 +54,11 @@ def rename_labels(xp: xr.Dataset, **coords):
 
 @registry.component("rotate")
 def rotate(xp: xr.Dataset, rotation=0):
-    # xp["image"].data = dask_image.ndinterp.rotate(
-    #     xp.image.data, rotation, axes=(-1, -2), reshape=False
-    # )
+    if not rotation:
+        return xp
+    xp["image"].data = dask_image.ndinterp.rotate(
+        xp.image.data, rotation, axes=(-1, -2), reshape=False
+    )
     return xp
 
 
@@ -111,7 +114,7 @@ def basic_correct(xp: xr.Dataset):
         tiles = da.map_blocks(transform, tiles.data, dtype=tiles.dtype)
         xp["tile"].loc[{"channel": channel}] = tiles
 
-    xp.mg.cache("tile")
+    xp["tile"].data = caching.cache(xp["tile"].data)
     return xp
 
 

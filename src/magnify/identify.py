@@ -25,7 +25,8 @@ def identify_buttons(assay, shape=None, pinlist=None, blank=None):
         # Zero-index the indices.
         cols, rows = np.array(df["Indices"].to_list()).T - 1
         names = df["MutantID"].to_numpy(dtype=str, na_value="")
-        names_array = np.empty((max(rows) + 1, max(cols) + 1), dtype=names.dtype)
+        # Chambers absent from the pinlist default to blank ("").
+        names_array = np.full((max(rows) + 1, max(cols) + 1), "", dtype=names.dtype)
         names_array[rows, cols] = names
     elif shape is not None:
         names_array = np.empty((shape[0], shape[1]), dtype="<U200")
@@ -183,7 +184,6 @@ def identify_mrbles(assay, spectra, codes, reference="eu"):
     log_cond_probs[:, -1] = -np.log(X_r.max(axis=0) - X_r.min(axis=0)).sum()
     probs = None
 
-    tag_names = np.append(tag_names, "outlier")
     # Run the Expectation-Maximization algorithm.
     for _ in range(50):
         # E-step: Compute the probability of each point belonging to each component.

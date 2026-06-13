@@ -12,7 +12,7 @@ __all__ = [
     "image_pipe",
     "save",
     "load",
-    "accessor",
+    "caching",
     "filter",
     "find",
     "identify",
@@ -22,7 +22,7 @@ __all__ = [
     "stitch",
 ]
 
-from . import accessor, filter, find, identify, postprocess, preprocess, reader, stitch
+from . import caching, filter, find, identify, postprocess, preprocess, reader, stitch
 from .file import (
     load,
     save,

@@ -1,6 +1,5 @@
 import math
 
-import dask.array as da
 import numpy as np
 import scipy
 import tqdm
@@ -53,21 +52,16 @@ class ButtonFinder:
         self.search_channels = utils.to_list(search_channel)
 
     def __call__(self, assay: xr.Dataset) -> xr.Dataset:
-        if not self.search_channels:
-            self.search_channels = assay.channel
+        # Resolve the channels to search, defaulting to all channels. Use a local variable so we
+        # don't mutate the component config across assays.
+        search_channels = (
+            self.search_channels if self.search_channels else list(assay.channel.values)
+        )
 
         num_rows, num_cols = assay.tag.shape
 
-        # Store each channel and timesteps for each marker in one chunk and set marker row/col
-        # sizes so each chunk ends up being at least 1MB. We will rechunk later.
-        chunk_bytes = 1e6
-        # Don't take into account dtype size since fg/bg bool arrays should also be 1MB.
-        roi_bytes = self.roi_length**2
-        # Prioritize larger row chunks since we're more likely to want whole columns than rows.
-        row_chunk_size = min(math.ceil(chunk_bytes / roi_bytes), num_rows)
-        col_chunk_size = math.ceil(chunk_bytes / (roi_bytes * row_chunk_size))
-        # Create the array of subimage regions.
-        roi = da.empty(
+        # Create the array of subimage regions as an in-memory numpy array.
+        roi = np.empty(
             (
                 num_rows,
                 num_cols,
@@ -77,15 +71,8 @@ class ButtonFinder:
                 self.roi_length,
             ),
             dtype=assay.image.dtype,
-            chunks=(
-                row_chunk_size,
-                col_chunk_size,
-                1,
-                1,
-                self.roi_length,
-                self.roi_length,
-            ),
         )
+        mask_shape = (num_rows, num_cols, assay.sizes["time"], self.roi_length, self.roi_length)
         assay["roi"] = (
             ("mark_row", "mark_col", "channel", "time", "roi_y", "roi_x"),
             roi,
@@ -93,17 +80,11 @@ class ButtonFinder:
         assay = assay.assign_coords(
             fg=(
                 ("mark_row", "mark_col", "time", "roi_y", "roi_x"),
-                da.empty_like(
-                    roi,
-                    dtype=bool,
-                )[:, :, 0],
+                np.empty(mask_shape, dtype=bool),
             ),
             bg=(
                 ("mark_row", "mark_col", "time", "roi_y", "roi_x"),
-                da.empty_like(
-                    roi,
-                    dtype=bool,
-                )[:, :, 0],
+                np.empty(mask_shape, dtype=bool),
             ),
             x=(
                 ("mark_row", "mark_col", "time"),
@@ -121,7 +102,7 @@ class ButtonFinder:
             images = assay.image.isel(time=t).compute()
             # Find button centers.
             assay.x[..., t], assay.y[..., t] = self.find_centers(
-                images.sel(channel=self.search_channels), assay
+                images.sel(channel=search_channels), assay
             )
 
             # Compute the roi, foreground and background masks for all buttons.
@@ -132,12 +113,7 @@ class ButtonFinder:
                 assay.x[..., t],
                 assay.y[..., t],
                 assay.valid[..., t],
-            ) = self.find_rois(images, t, assay)
-            # Eagerly compute the roi values so the dask task graph doesn't get too large.
-            # TODO: Look into caching here or storing.
-            assay["roi"] = assay.roi.persist()
-            assay["fg"] = assay.fg.persist()
-            assay["bg"] = assay.bg.persist()
+            ) = self.find_rois(images, t, assay, search_channels)
 
         # Now fill in the remaining timesteps where we aren't searching.
         for t, time in enumerate(tqdm.tqdm(assay.time, disable=not self.progress_bar)):
@@ -155,7 +131,7 @@ class ButtonFinder:
             images = assay.image.sel(time=time).to_numpy()
             x = assay.x[..., copy_t].to_numpy()
             y = assay.y[..., copy_t].to_numpy()
-            roi = np.empty_like(assay.roi[:, :, :, t])
+            roi = np.empty(assay.roi.isel(time=t).shape, dtype=assay.roi.dtype)
             # Update the roi since the location is copied but the roi images are timestep specific.
             for i in range(num_rows):
                 for j in range(num_cols):
@@ -174,31 +150,7 @@ class ButtonFinder:
             assay.x[..., t] = x
             assay.y[..., t] = y
             assay.valid[..., t] = assay.valid[..., copy_t]
-            # Eagerly compute the roi values so the dask task graph doesn't get too large.
-            # TODO: Look into caching here or storing.
-            assay["roi"] = assay.roi.persist()
-            assay["fg"] = assay.fg.persist()
-            assay["bg"] = assay.bg.persist()
         assay = assay.stack(mark=("mark_row", "mark_col"), create_index=True).transpose("mark", ...)
-        # Rechunk the array to chunk along markers since users will usually want
-        # to slice along that dimension.
-        mark_chunk_size = min(
-            math.ceil(chunk_bytes / (roi_bytes * assay.sizes["time"] * assay.sizes["channel"])),
-            num_rows,
-        )
-        chunk_sizes = {
-            "mark": mark_chunk_size,
-            "channel": assay.sizes["channel"],
-            "time": assay.sizes["time"],
-            "roi_y": assay.sizes["roi_y"],
-            "roi_x": assay.sizes["roi_x"],
-        }
-        # Cache the rechunked array to prevent delays.
-        assay["roi"] = assay.roi.chunk(chunk_sizes)
-        chunk_sizes.pop("channel")
-        assay["fg"] = assay.fg.chunk(chunk_sizes)
-        assay["bg"] = assay.bg.chunk(chunk_sizes)
-        assay.mg.cache(["roi", "fg", "bg"])
 
         return assay
 
@@ -305,7 +257,7 @@ class ButtonFinder:
 
         return mark_x, mark_y
 
-    def find_rois(self, images: xr.DataArray, t: int, assay: xr.Dataset):
+    def find_rois(self, images: xr.DataArray, t: int, assay: xr.Dataset, search_channels):
         # Convert all relevant quantities to numpy arrays since xarrays are very slow
         # when iterated over.
         images = images.to_numpy()
@@ -314,12 +266,10 @@ class ButtonFinder:
         x = assay.x[:, :, t].to_numpy()
         y = assay.y[:, :, t].to_numpy()
         valid = assay.valid[:, :, t].to_numpy()
-        roi = np.empty_like(assay.roi.isel(time=t))
-        fg = np.empty_like(assay.fg.isel(time=t), dtype=bool)
+        roi = np.empty(assay.roi.isel(time=t).shape, dtype=assay.roi.dtype)
+        fg = np.empty(assay.fg.isel(time=t).shape, dtype=bool)
         bg = np.empty_like(fg)
-        search_channel_idxs = [
-            list(assay.channel.to_numpy()).index(c) for c in self.search_channels
-        ]
+        search_channel_idxs = [list(assay.channel.to_numpy()).index(c) for c in search_channels]
 
         for i in range(num_rows):
             for j in range(num_cols):
@@ -346,7 +296,7 @@ class ButtonFinder:
                                 1 - np.pi * self.min_button_radius / self.roi_length**2
                             ),
                             grid_length=20,
-                            num_iter=self.num_iter // (num_rows * num_cols),
+                            num_iter=max(1, self.num_iter // (num_rows * num_cols)),
                             min_radius=self.min_button_radius,
                             max_radius=self.max_button_radius,
                             min_dist=0,
@@ -469,11 +419,14 @@ class BeadFinder:
         self.gui = InteractiveUI() if interactive else None
 
     def __call__(self, assay: xr.Dataset) -> xr.Dataset:
-        if not self.search_channels:
-            self.search_channels = assay.channel
+        # Resolve the channels to search, defaulting to all channels. Use a local variable so we
+        # don't mutate the component config across assays.
+        search_channels = (
+            self.search_channels if self.search_channels else list(assay.channel.values)
+        )
 
         beads = np.empty((0, 3))
-        for search_channel in self.search_channels:
+        for search_channel in search_channels:
             image = utils.to_uint8(assay.image.isel(time=0).sel(channel=search_channel).to_numpy())
             b = utils.find_circles(
                 image,
@@ -487,7 +440,7 @@ class BeadFinder:
                 min_roundness=self.min_roundness,
                 gui=self.gui,
             )[0]
-            if len(beads) > 0:
+            if len(beads) > 0 and len(b) > 0:
                 # Exclude beads that we've already seen.
                 duplicates = np.array(
                     [
@@ -495,19 +448,15 @@ class BeadFinder:
                         for neighbors in scipy.spatial.KDTree(beads[:, :2]).query_ball_point(
                             b[:, :2], 2 * self.min_bead_radius
                         )
-                    ]
+                    ],
+                    dtype=bool,
                 )
                 b = b[~duplicates]
             beads = np.concatenate([beads, b])
 
         num_beads = len(beads)
-        # Store each channel and timesteps for each marker in one chunk and set marker row/col
-        # sizes so each chunk ends up being at least 1MB.
-        chunk_bytes = 1e6
-        # Don't take into account dtype size since fg/bg bool arrays should also be 1MB.
-        roi_bytes = self.roi_length**2
-        # Create the array of subimage regions.
-        roi = da.empty(
+        # Create the array of subimage regions as an in-memory numpy array.
+        roi = np.empty(
             (
                 num_beads,
                 assay.sizes["channel"],
@@ -516,29 +465,18 @@ class BeadFinder:
                 self.roi_length,
             ),
             dtype=assay.image.dtype,
-            chunks=(
-                min(
-                    math.ceil(
-                        chunk_bytes / (roi_bytes * assay.sizes["channel"] * assay.sizes["time"])
-                    ),
-                    num_beads,
-                ),
-                assay.sizes["channel"],
-                assay.sizes["time"],
-                self.roi_length,
-                self.roi_length,
-            ),
         )
+        mask_shape = (num_beads, assay.sizes["time"], self.roi_length, self.roi_length)
 
         assay["roi"] = (("mark", "channel", "time", "roi_y", "roi_x"), roi)
         assay = assay.assign_coords(
             fg=(
                 ("mark", "time", "roi_y", "roi_x"),
-                da.empty_like(roi, dtype=bool)[:, 0],
+                np.empty(mask_shape, dtype=bool),
             ),
             bg=(
                 ("mark", "time", "roi_y", "roi_x"),
-                da.empty_like(roi, dtype=bool)[:, 0],
+                np.empty(mask_shape, dtype=bool),
             ),
             x=(
                 ("mark", "time"),
@@ -567,7 +505,6 @@ class BeadFinder:
         y = assay.y.isel(time=0).to_numpy()
         fg = np.empty((num_beads,) + assay.fg.shape[2:], dtype=bool)
         bg = np.empty_like(fg)
-        image = assay.image.isel(time=0).sel(channel=self.search_channels).to_numpy()
         for i in range(num_beads):
             # Set the subimage region for this bead.
             top, bottom, left, right = utils.bounding_box(
@@ -601,7 +538,6 @@ class BeadFinder:
                 roi[j] = image[..., top:bottom, left:right]
             assay.roi[:, i] = roi
 
-        assay.mg.cache(["roi", "fg", "bg"])
         return assay
 
     @registry.components.register("find_beads")
@@ -644,7 +580,9 @@ def cluster_1d(
 
     min_cost = np.inf
     best_spans = None
-    for offset in range(total_length - round(num_clusters * cluster_length)):
+    # Try every offset that keeps the cluster grid within the image (0..N inclusive). Always run at
+    # least once so a grid that doesn't fit still produces a best-effort clustering instead of None.
+    for offset in range(max(1, total_length - round(num_clusters * cluster_length) + 1)):
         # Compute the boundaries and center of each cluster.
         boundaries = np.arange(num_clusters + 1) * cluster_length + offset
         centers = (boundaries[1:] + boundaries[:-1]) / 2
@@ -704,10 +642,12 @@ def regress_clusters(
 ) -> tuple[np.ndarray, np.ndarray]:
     if num_clusters == 1:
         # If we only have a single cluster then we can't average regression results.
+        # Return the intercept as a length-1 array to match the multi-cluster return shape.
         if len(x) == 1:
-            return 0, y
+            return 0, np.asarray(y)
         else:
-            return scipy.stats.linregress(x, y)[:2]
+            slope, intercept = scipy.stats.linregress(x, y)[:2]
+            return slope, np.array([intercept])
 
     # Find the best line per-cluster.
     slopes = np.full(num_clusters, np.nan)

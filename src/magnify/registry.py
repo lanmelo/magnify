@@ -72,8 +72,8 @@ def microfluidic_chip(
         image grid.
     pinlist :
         A file path to a CSV file that describes the tag to assign to each chamber on the
-        chip. The CSV file must include a column called `Indices` that contains row and
-        column pairs in the format `(row, col)`, and a `MutantID` column with the button
+        chip. The CSV file must include a column called `Indices` that contains column and
+        row pairs in the format `(col, row)`, and a `MutantID` column with the button
         names. Either `pinlist` or `shape` must be provided.
     blank :
         Values representing "blank" or non-expressed buttons in the pinlist, which will
